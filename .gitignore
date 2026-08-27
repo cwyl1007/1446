@@ -1,0 +1,10 @@
+__pycache__
+dataset
+results
+configs
+
+*_sets
+checkpoints
+
+logs
+tests
