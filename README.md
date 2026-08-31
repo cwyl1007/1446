@@ -22,11 +22,10 @@ Base datasets are stored under `dataset/` and download on first use when the
 source supports it.
 
 Supported PyG datasets are `cora`, `citeseer`, `pubmed`, `amazon-c`,
-`amazon-p`, `wiki-chameleon`, `wiki-squirrel`, `reddit`,  and
-`facebook`. Supported OGB datasets are `ogbl-collab`, `ogbl-ddi`, `ogbl-ppa`,
-and `ogbl-citation2`.
+`amazon-p`, `wiki-chameleon`, `wiki-squirrel`,  and `facebook`. 
+Supported OGB datasets are `collab`, `ddi`, `ppa`, and `citation2`.
 
-Model runner names are `mf`, `mlp`, `ppr`, `concat`, `gcn`, `gat`, `sage`,
+Model runner names are `mf`, `mlp`, `gcn`, `gat`, `sage`,
 `gae`, `seal`, `buddy`, `neo-gnn`, `ncn`, `ncnc`, `nbfnet`, `peg`, `lpformer`,
 and `n2v`. Use `heuristics` for the non-learned heuristic suite.
 
@@ -63,8 +62,8 @@ python -m ogbl.main --device cuda --mode heart --dataset ogbl-collab --model gcn
 Node2Vec and heuristics use `pyg.n2v_main`, `ogbl.n2v_main`,
 `pyg.heuristics_main`, and `ogbl.heuristics_main`.
 
-For a batch, edit the quoted variables at the top of `scripts/pyg_run.sh` or
-`scripts/ogbl_run.sh`:
+To run various experiments in batches, edit the quoted variables at the top of `scripts/pyg_run.sh` or
+`scripts/ogbl_run.sh` to configure the run:
 
 ```sh
 MODES="heart"
