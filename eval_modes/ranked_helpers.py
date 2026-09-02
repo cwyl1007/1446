@@ -526,6 +526,9 @@ def ranked_candidate_pool(bundle, context, both_sides, *, spec):
 
 CONCAT_SHARD_FORMAT = "endpoint-side-node-int32-shards-v1"
 MAX_UNCACHED_MATERIALIZED_BYTES = 2 * 1024**3
+_SHARED_MAX_CACHE_K = {"learnedfeat": 2000}
+
+
 class RankedNegativeResult(NamedTuple):
     negatives: Any
     metadata: dict[str, Any]
@@ -657,16 +660,18 @@ class RankedNegativeShards:
         shards: Sequence[_NegativeShard],
         default_chunk_size: int = 2048,
         candidate_summary: Optional[Mapping[str, Any]] = None,
+        storage_k: Optional[int] = None,
     ) -> None:
         self.manifest_path = str(Path(manifest_path).resolve())
         self.queries = _edge_rows(queries, "ranked-negative queries")
         self.num_nodes = int(num_nodes)
         self.effective_k = int(effective_k)
+        self.storage_k = self.effective_k if storage_k is None else int(storage_k)
         self.shards = tuple(shards)
         self.default_chunk_size = max(1, int(default_chunk_size))
         self.candidate_summary = dict(candidate_summary) if candidate_summary is not None else None
         self.shape = (int(self.queries.size(0)), int(self.effective_k), 2)
-        if self.num_nodes <= 1 or self.effective_k <= 0:
+        if self.num_nodes <= 1 or self.effective_k <= 0 or self.effective_k > self.storage_k:
             raise ValueError("Invalid ranked-negative shard dimensions.")
         expected = 0
         for shard in self.shards:
@@ -703,7 +708,7 @@ class RankedNegativeShards:
         if not isinstance(payload, Mapping):
             raise ValueError("Ranked-negative shard payload is not a mapping.")
         encoded = payload.get("encoded")
-        expected_shape = (shard.end - shard.start, self.effective_k)
+        expected_shape = (shard.end - shard.start, self.storage_k)
         if not torch.is_tensor(encoded) or encoded.dtype != torch.int32 or tuple(encoded.shape) != expected_shape:
             raise ValueError("Ranked-negative shard has the wrong compact tensor layout.")
         return encoded
@@ -716,7 +721,7 @@ class RankedNegativeShards:
                 local_end = min(local_start + chunk_size, int(encoded.size(0)))
                 start = shard.start + local_start
                 end = shard.start + local_end
-                compact = encoded[local_start:local_end].to(torch.long)
+                compact = encoded[local_start:local_end, : self.effective_k].to(torch.long)
                 sides = torch.div(compact, self.num_nodes, rounding_mode="floor")
                 nodes = compact.remainder(self.num_nodes)
                 if compact.numel() and (int(sides.min().item()) < 0 or int(sides.max().item()) > 1):
@@ -728,6 +733,34 @@ class RankedNegativeShards:
                 edges[:, :, 1] = torch.where(left, nodes, query[:, 1:2])
                 yield (start, end, edges)
 
+    def prefix(self, effective_k: int):
+        width = int(effective_k)
+        if width == self.effective_k:
+            return self
+        if width <= 0 or width > self.effective_k:
+            raise ValueError("Ranked-negative prefix width is out of range.")
+        view = RankedNegativeShards(
+            manifest_path=self.manifest_path,
+            queries=self.queries,
+            num_nodes=self.num_nodes,
+            effective_k=width,
+            storage_k=self.storage_k,
+            shards=self.shards,
+            default_chunk_size=self.default_chunk_size,
+        )
+        left_min, left_max, left_sum = width, 0, 0
+        for shard in self.shards:
+            encoded = view._load_encoded(shard)[:, :width]
+            if encoded.size(0):
+                counts = (encoded < self.num_nodes).sum(dim=1)
+                left_min = min(left_min, int(counts.min().item()))
+                left_max = max(left_max, int(counts.max().item()))
+                left_sum += int(counts.sum().item())
+        view.candidate_summary = _candidate_summary(
+            int(self.queries.size(0)), width, left_min, left_max, left_sum
+        )
+        return view
+
     def materialize(self) -> torch.Tensor:
         output = torch.empty(self.shape, dtype=torch.long)
         for start, end, block in self.iter_chunks():
@@ -736,6 +769,28 @@ class RankedNegativeShards:
 
     def __repr__(self) -> str:
         return f"RankedNegativeShards(shape={self.shape}, num_nodes={self.num_nodes}, shards={len(self.shards)})"
+
+
+def _shared_cache_prefix(
+    result: RankedNegativeResult, *, requested_k: int, effective_k: int, cache_k: int
+) -> RankedNegativeResult:
+    stored_k = int(result.negatives.size(1))
+    if int(effective_k) > stored_k:
+        raise ValueError("Shared ranked-negative cache is narrower than the requested prefix.")
+    if isinstance(result.negatives, RankedNegativeShards):
+        negatives = result.negatives.prefix(effective_k)
+    elif torch.is_tensor(result.negatives):
+        negatives = result.negatives[:, :effective_k].contiguous()
+    else:
+        raise TypeError("Shared ranked-negative cache does not support prefix selection.")
+    metadata = dict(result.metadata)
+    metadata.update(
+        requested_k=int(requested_k),
+        effective_total_across_both_endpoint_sides=int(effective_k),
+        backing_cache_requested_k=int(cache_k),
+        backing_cache_effective_k=stored_k,
+    )
+    return RankedNegativeResult(negatives, metadata, result.cache_path, result.cache_hit)
 
 
 def _normal_framework(value: str) -> str:
@@ -2374,6 +2429,7 @@ def load_or_create_mlp_family_test_negatives(
     selector_label = str(spec.get("display_name", selector_model.upper()))
     device = torch.device(device)
     k = int(spec.get("default_k", 500)) if k is None else int(k)
+    cache_k = max(k, _SHARED_MAX_CACHE_K.get(selector_model, k)) if cache_dir is not None else k
     score_batch_size = int(score_batch_size)
     seed = int(seed)
     epochs = int(epochs)
@@ -2430,8 +2486,15 @@ def load_or_create_mlp_family_test_negatives(
             selector_weight_decay=selector_weight_decay)
     if global_top_k:
         requested_side_k = effective_side_k = None
-        effective_k = _global_top_k_layout(
+        requested_effective_k = _global_top_k_layout(
             queries=queries, filter_layout=filter_layout, num_nodes=num_nodes, k=k
+        )
+        effective_k = (
+            requested_effective_k
+            if cache_k == k
+            else _global_top_k_layout(
+                queries=queries, filter_layout=filter_layout, num_nodes=num_nodes, k=cache_k
+            )
         )
     else:
         requested_side_k, effective_side_k = _balanced_side_layout(
@@ -2444,6 +2507,7 @@ def load_or_create_mlp_family_test_negatives(
                 f"the common legal capacity supports only {effective_side_k} per side."
             )
         effective_k = 2 * effective_side_k
+        requested_effective_k = effective_k
     positive_protocol = str(spec["citation2_positive_protocol"] if directed else spec["positive_protocol"])
     split_protocol = f"{positive_protocol};train={train_source};valid={valid_source};test={test_source};queries={query_source}"
     validation_source_identity = (
@@ -2486,7 +2550,7 @@ def load_or_create_mlp_family_test_negatives(
         "eligibility_directionality": filter_layout.directionality,
         "blocked_role_sha256": blocked_role_sha,
         "eligibility_right_role_offset": int(filter_layout.right_role_offset),
-        "requested_k": k,
+        "requested_k": cache_k,
         "effective_k": effective_k,
         "num_nodes": num_nodes,
         "num_queries": int(queries.size(0)),
@@ -2532,12 +2596,26 @@ def load_or_create_mlp_family_test_negatives(
                 "selector_validation_source": validation_source_identity["selector_validation_source"],
             }
         )
+    legacy_identity = None
+    if cache_k != k:
+        legacy_identity = dict(identity)
+        legacy_identity.update(requested_k=k, effective_k=requested_effective_k)
+        legacy_key = hashlib.sha256(
+            json.dumps(legacy_identity, sort_keys=True, separators=(",", ":")).encode("utf8")
+        ).hexdigest()
+        legacy_identity["cache_key"] = legacy_key
     cache_key = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf8")).hexdigest()
     identity["cache_key"] = cache_key
     cache_path: Optional[str] = None
+    legacy_cache_path: Optional[str] = None
     if cache_dir is not None:
         directory = Path(cache_dir).expanduser().resolve()
         cache_path = str(directory / f"{selector_model}_test_neg_v{cache_version}_{framework}_{_safe_filename(dataset)}_{cache_key[:24]}.pt")
+        if legacy_identity is not None:
+            legacy_cache_path = str(
+                directory
+                / f"{selector_model}_test_neg_v{cache_version}_{framework}_{_safe_filename(dataset)}_{legacy_key[:24]}.pt"
+            )
     elif int(queries.size(0)) * effective_k * 2 * 8 > MAX_UNCACHED_MATERIALIZED_BYTES:
         raise ValueError(f"Large {selector_label} evaluation requires cache_dir for streaming negatives.")
 
@@ -2565,18 +2643,50 @@ def load_or_create_mlp_family_test_negatives(
             "effective_total_across_both_endpoint_sides": effective_k,
         }
 
+    def serve(result: RankedNegativeResult) -> RankedNegativeResult:
+        if cache_k == k:
+            return result
+        return _shared_cache_prefix(
+            result,
+            requested_k=k,
+            effective_k=requested_effective_k,
+            cache_k=cache_k,
+        )
+
     def load_or_generate() -> RankedNegativeResult:
         if cache_path is not None and os.path.isfile(cache_path):
             try:
-                return _load_cached_ranked_result(
-                    cache_path, identity, queries, num_nodes, effective_k, directed, selector_model, filter_layout,
-                    expected_per_side_k=None if global_top_k else effective_side_k,
+                return serve(
+                    _load_cached_ranked_result(
+                        cache_path, identity, queries, num_nodes, effective_k, directed, selector_model, filter_layout,
+                        expected_per_side_k=None if global_top_k else effective_side_k,
+                    )
                 )
             except Exception as exc:
                 raise RuntimeError(
                     f"Existing {selector_label} candidate cache is invalid; refusing implicit selector retraining/rebuild: "
                     f"{cache_path}. Remove or quarantine it explicitly before requesting a cold rebuild."
                 ) from exc
+        if legacy_cache_path is not None and (
+            os.path.isfile(legacy_cache_path) or os.path.exists(f"{legacy_cache_path}.lock")
+        ):
+            with _exclusive_cache_lock(legacy_cache_path):
+                if os.path.isfile(legacy_cache_path):
+                    try:
+                        return _load_cached_ranked_result(
+                            legacy_cache_path,
+                            legacy_identity,
+                            queries,
+                            num_nodes,
+                            requested_effective_k,
+                            directed,
+                            selector_model,
+                            filter_layout,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Existing {selector_label} legacy candidate cache is invalid: {legacy_cache_path}."
+                        ) from exc
         if frozen:
             assert state is not None and selector_provenance is not None
             model = spec["build"](config=config, state=state, dataset=dataset, num_nodes=num_nodes,
@@ -2619,12 +2729,12 @@ def load_or_create_mlp_family_test_negatives(
             cache_metadata = metadata(generation_provenance)
             storage = _ranked_shard_storage(negatives, descriptors, num_nodes)
             _atomic_save({"metadata": cache_metadata, "storage": storage}, cache_path)
-            return RankedNegativeResult(negatives, cache_metadata, cache_path, False)
+            return serve(RankedNegativeResult(negatives, cache_metadata, cache_path, False))
         negatives = _select_ranked_queries(
             queries, filter_layout, embedding, model, k, effective_k, score_batch_size, device,
             global_top_k=global_top_k,
         )
-        return RankedNegativeResult(negatives, metadata(generation_provenance), None, False)
+        return serve(RankedNegativeResult(negatives, metadata(generation_provenance), None, False))
 
     if cache_path is None:
         return load_or_generate()

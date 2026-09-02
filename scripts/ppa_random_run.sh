@@ -49,6 +49,7 @@ run_queue()
         --negative-seed 3001 \
         --test-cap 100000 \
         --negatives 500 \
+        --compute-auc no \
         --no-save
     ) > "$queue_output" 2>&1
     then

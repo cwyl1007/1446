@@ -41,6 +41,14 @@ case "$TEST_POSITIVE_CAP" in
     exit 2
     ;;
 esac
+[ -n "$COMPUTE_AUC" ] || COMPUTE_AUC="no"
+case "$COMPUTE_AUC" in
+  yes|no) ;;
+  *)
+    echo "COMPUTE_AUC must be yes or no." >&2
+    exit 2
+    ;;
+esac
 CHECKPOINT_ROOT_PATH="$CHECKPOINT_ROOT"
 case "$CHECKPOINT_ROOT_PATH" in
   /*) ;;
@@ -319,7 +327,8 @@ launch_task()
       --candidate-policy "$CANDIDATE_POLICY" \
       --test-positive-cap "$TEST_POSITIVE_CAP" \
       --root "$DATA_ROOT" \
-      --comparison-batch-size "$COMPARISON_BATCH_SIZE"
+      --comparison-batch-size "$COMPARISON_BATCH_SIZE" \
+      --compute-auc "$COMPUTE_AUC"
     if [ -n "$SELECTOR_POLICY" ]
     then
       SELECTOR_NEGATIVES="$(selector_negatives_for_dataset "$LAUNCH_DATASET")"

@@ -207,6 +207,7 @@ def parse_args():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--metric", type=str, default="mrr")
+    parser.add_argument("--compute-auc", choices=["yes", "no"], default="yes")
     parser.add_argument("--mode", choices=["heart", "all", "ranked-selector"], default="heart")
     parser.add_argument("--root", default="dataset")
     parser.add_argument("--eval-cap", "--eval_cap", dest="eval_cap", type=int, default=None, help="Positive-query cap; generated Reddit HeaRT defaults to 100000.")
@@ -678,6 +679,7 @@ def main():
         training_summary += f", heart_batch_size={heart_batch_size}"
     print(training_summary)
     metric_key = args.metric.strip()
+    compute_auc = args.compute_auc == "yes"
     test_selected_metrics = []
     test_aucs = []
     test_aps = []
@@ -718,6 +720,9 @@ def main():
     validation_only_mode = args.mode in {"heart", "ranked-selector"}
     selection_requires_auc = metric_key.lower() in {"auc", "ap"}
     selection_requires_hits = metric_key.lower() != "mrr"
+    if selection_requires_auc and not compute_auc:
+        raise ValueError("--metric AUC/AP requires --compute-auc yes.")
+    print(f"compute_auc_effective={compute_auc}", flush=True)
     for key, value in heart_candidate_metadata.items():
         print(f"{key}={(value if value is not None else 'not-applicable')}", flush=True)
     print(
@@ -918,7 +923,15 @@ def main():
                     )
                 else:
                     (results_rank, _) = test(
-                        model, data, x, evaluator_hit, evaluator_mrr, eval_batch_size, profile=eval_profile, return_scores=False
+                        model,
+                        data,
+                        x,
+                        evaluator_hit,
+                        evaluator_mrr,
+                        eval_batch_size,
+                        profile=eval_profile,
+                        return_scores=False,
+                        include_auc=compute_auc,
                     )
             finally:
                 _restore_metric_timers(orig_mrr, orig_mrr_only, orig_auc)
@@ -983,7 +996,14 @@ def main():
                 deferred_profiler = StageProfiler(device)
                 deferred_profiler.start()
                 try:
-                    final_validation_metrics = validation_only(model, data, x, eval_batch_size, profile=deferred_profile, include_auc=True)
+                    final_validation_metrics = validation_only(
+                        model,
+                        data,
+                        x,
+                        eval_batch_size,
+                        profile=deferred_profile,
+                        include_auc=compute_auc,
+                    )
                 finally:
                     _restore_metric_timers(orig_mrr, orig_mrr_only, orig_auc)
                     deferred_info = deferred_profiler.stop()
@@ -1028,7 +1048,14 @@ def main():
                 final_profiler = StageProfiler(device)
                 final_profiler.start()
                 try:
-                    final_test_metrics = test_only(model, data, x, eval_batch_size, profile=final_profile)
+                    final_test_metrics = test_only(
+                        model,
+                        data,
+                        x,
+                        eval_batch_size,
+                        profile=final_profile,
+                        include_auc=compute_auc,
+                    )
                 finally:
                     final_info = final_profiler.stop()
                 run_test_sec = float(final_info["sec"])
@@ -1126,6 +1153,7 @@ def main():
     header_lines = [
         "\n" + "=" * 80, "Timing summary", f"dataset: {args.dataset}", f"mode: {args.mode}", f"model: {output_model_name}",
         f"device: {device}", f"evaluation_positive_cap: {args.eval_cap}",
+        f"compute_auc: {args.compute_auc}",
         "evaluation_scope: " + (
             "deterministic_neutral_validation_rows"
             if selector_training_mode

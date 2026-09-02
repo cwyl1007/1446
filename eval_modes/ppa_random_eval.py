@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     add("--row-batch-size", type=int, default=512)
     add("--edge-batch-size", type=int, default=0)
     add("--source-batch-size", type=int)
+    add("--compute-auc", choices=("yes", "no"), default="yes")
     add("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     add("--output")
     add("--no-save", action="store_true")
@@ -324,6 +325,7 @@ def evaluate_one_checkpoint(
             f"run {checkpoint.get('run', '?')} PPA random",
             candidate_label="uniform-random-legal-PPA",
             endpoint_score_reuse_safe=getattr(model, "decode_is_dedup_safe", None) is True,
+            compute_auc=args.compute_auc == "yes",
         )
     finally:
         release_model(model, context)
@@ -391,6 +393,7 @@ def evaluate_one_heuristic(
         candidate_label="uniform-random-legal-PPA",
         negative_edges_for_scoring=scoring_candidates,
         endpoint_score_reuse_safe=True,
+        compute_auc=args.compute_auc == "yes",
     )
     elapsed = round(time.perf_counter() - started, 3)
     split_result["elapsed_seconds"] = elapsed
@@ -408,7 +411,10 @@ def evaluate_one_heuristic(
 
 def aggregate_results(results: list[Dict[str, object]]) -> Dict[str, object]:
     aggregate: Dict[str, object] = {"test": {}}
-    for metric in ("MRR", *(f"Hits@{k}" for k in HITS_K), "AUC"):
+    metrics = ("MRR", *(f"Hits@{k}" for k in HITS_K))
+    if results and "AUC" in results[0]["splits"]["test"]["metrics"]:
+        metrics = (*metrics, "AUC")
+    for metric in metrics:
         values = [float(result["splits"]["test"]["metrics"][metric]) for result in results]
         aggregate["test"][metric] = {
             "mean": statistics.fmean(values),
@@ -419,7 +425,10 @@ def aggregate_results(results: list[Dict[str, object]]) -> Dict[str, object]:
 
 
 def print_metrics(label: str, metrics: Dict[str, float]) -> None:
-    rendered = " ".join((f"{name}={100.0 * float(metrics[name]):.6f}%" for name in ("MRR", *(f"Hits@{k}" for k in HITS_K), "AUC")))
+    names = ("MRR", *(f"Hits@{k}" for k in HITS_K))
+    if "AUC" in metrics:
+        names = (*names, "AUC")
+    rendered = " ".join((f"{name}={100.0 * float(metrics[name]):.6f}%" for name in names))
     print(f"{label}: {rendered}", flush=True)
 
 
@@ -501,7 +510,8 @@ def main() -> int:
         f"dataset={DATASET} model={args.model} device={device}\n"
         f"test_positive_rows={int(bundle['test_pos'].size(0))} "
         f"negatives_per_positive={NEGATIVES_PER_POSITIVE}\n"
-        f"legality={legality_description}",
+        f"legality={legality_description}\n"
+        f"compute_auc={args.compute_auc}",
         flush=True,
     )
     payload = {
@@ -511,6 +521,7 @@ def main() -> int:
         "dataset": DATASET,
         "model": "heuristics" if heuristic_mode else args.model,
         "checkpoint_mode": None if heuristic_mode else CHECKPOINT_MODE,
+        "compute_auc": args.compute_auc == "yes",
         "torch_cpu_threads": int(torch_threads),
         "candidate_sampling": sampler_metadata,
     }

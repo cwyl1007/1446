@@ -24,7 +24,7 @@ METRIC_NAMES = ("AUC", "MRR", *(f"Hits@{k}" for k in HITS_K))
 
 
 def _format_metrics(label, scores, precision):
-    return f"{label} " + " ".join(f"{name}={100 * scores[name]:.{precision}f}" for name in METRIC_NAMES)
+    return f"{label} " + " ".join(f"{name}={100 * scores[name]:.{precision}f}" for name in METRIC_NAMES if name in scores)
 
 
 def make_auc_arrays(pos_pred, neg_pred):
@@ -57,14 +57,14 @@ def _score_heuristic_edges_bounded(method, rowptr, col, deg, adj, edges, kwargs,
     return torch.cat(parts) if parts else torch.empty(0, dtype=torch.float32, device=output_device)
 
 
-def _streamed_heuristic_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, kwargs):
+def _streamed_heuristic_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, kwargs, *, compute_auc=True):
     positives = pos_edge.to(dtype=torch.long).cpu()
     comparison_device = torch.device(kwargs.get("device", "cpu"))
     pos_pred = _score_heuristic_edges_bounded(method, rowptr, col, deg, adj, positives, kwargs, output_device=comparison_device)
     num_rows = int(pos_pred.numel())
     ge_counts = torch.zeros(num_rows, dtype=torch.int32)
     gt_counts = torch.zeros(num_rows, dtype=torch.int32)
-    auc = StreamingAUCAP(pos_pred)
+    auc = StreamingAUCAP(pos_pred) if compute_auc else None
     decoded_edges = 0
     logical_occurrences = 0
     symmetric_reverse_edges_reoriented = 0
@@ -99,7 +99,8 @@ def _streamed_heuristic_split(method, rowptr, col, deg, adj, pos_edge, neg_edge,
             side_rank_counts = torch.stack([(scores >= positive).sum(dim=1), (scores > positive).sum(dim=1)], dim=0).to(torch.int32).cpu()
             ge_counts.index_add_(0, row_ids, side_rank_counts[0])
             gt_counts.index_add_(0, row_ids, side_rank_counts[1])
-            auc.update_weighted(union_scores, chunk.union_occurrence_multiplicity)
+            if compute_auc:
+                auc.update_weighted(union_scores, chunk.union_occurrence_multiplicity)
     else:
         for start, end, grouped_edges in neg_edge.iter_grouped_chunks():
             flat = grouped_edges.reshape(-1, 2)
@@ -116,20 +117,22 @@ def _streamed_heuristic_split(method, rowptr, col, deg, adj, pos_edge, neg_edge,
             positive = pos_pred[start:end].view(-1, 1)
             ge_counts[start:end] = (scores >= positive).sum(dim=1).to(torch.int32).cpu()
             gt_counts[start:end] = (scores > positive).sum(dim=1).to(torch.int32).cpu()
-            auc.update_weighted(unique_scores, torch.bincount(inverse, minlength=int(unique_scores.numel())))
+            if compute_auc:
+                auc.update_weighted(unique_scores, torch.bincount(inverse, minlength=int(unique_scores.numel())))
     rank = 0.5 * (ge_counts.to(torch.float32) + gt_counts.to(torch.float32)) + 1.0
-    auc_out = auc.compute()
     neg_edge.last_evaluation_reuse = {
         "decoded_union_edges": decoded_edges,
         "logical_candidate_occurrences": logical_occurrences,
         "decode_reuse_ratio": logical_occurrences / decoded_edges if decoded_edges else 0.0,
         "symmetric_reverse_edges_reoriented": symmetric_reverse_edges_reoriented,
     }
-    return {
-        "AUC": auc_out["AUC"],
+    result = {
         "MRR": round(float((1.0 / rank).mean().item()), 4),
         **{f"Hits@{k}": round(float((rank <= k).to(torch.float32).mean().item()), 4) for k in HITS_K},
     }
+    if compute_auc:
+        result["AUC"] = auc.compute()["AUC"]
+    return result
 
 
 def _method_kwargs(method, device, reference_planetoid=False):
@@ -154,18 +157,19 @@ def _move_graph_to_device(graph, device):
     return (rowptr, col, deg, adj)
 
 
-def run_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, device, *, reference_planetoid=False):
+def run_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, device, *, reference_planetoid=False, compute_auc=True):
     kwargs = _method_kwargs(method, device, reference_planetoid)
     rank_device = torch.device(device)
     if _is_streamed_grouped_negative(neg_edge):
-        return _streamed_heuristic_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, kwargs)
+        return _streamed_heuristic_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, kwargs, compute_auc=compute_auc)
     pos_pred = score_edges(method, rowptr, col, deg, adj, pos_edge, **kwargs).view(-1).to(rank_device)
     if getattr(neg_edge, "is_ragged_negative", False):
         ranks = torch.empty(pos_pred.numel(), dtype=torch.float32, device=rank_device)
-        parts = []
+        parts = [] if compute_auc else None
         for start, end, flat_edges, local_rowptr in neg_edge.iter_ragged_chunks():
             scores = score_edges(method, rowptr, col, deg, adj, flat_edges, **kwargs).view(-1).detach().to(rank_device)
-            parts.append(scores)
+            if compute_auc:
+                parts.append(scores)
             lengths = (local_rowptr[1:] - local_rowptr[:-1]).to(rank_device)
             row_ids = torch.repeat_interleave(torch.arange(end - start, device=rank_device), lengths)
             repeated_positive = pos_pred[start:end].detach()[row_ids]
@@ -174,17 +178,16 @@ def run_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, device, *, refe
             optimistic.index_add_(0, row_ids, (scores >= repeated_positive).to(torch.float32))
             pessimistic.index_add_(0, row_ids, (scores > repeated_positive).to(torch.float32))
             ranks[start:end] = 0.5 * (optimistic + pessimistic) + 1.0
-        neg_pred = torch.cat(parts) if parts else torch.empty(0, dtype=torch.float32, device=rank_device)
-        (y_pred, y_true) = make_auc_arrays(pos_pred, neg_pred)
-        auc_out = evaluate_auc(y_pred, y_true)
-        return {
-            "AUC": auc_out["AUC"],
+        result = {
             "MRR": round(float((1.0 / ranks).mean()), 4),
             **{f"Hits@{k}": round(float((ranks <= k).to(torch.float32).mean()), 4) for k in HITS_K},
         }
+        if compute_auc:
+            neg_pred = torch.cat(parts) if parts else torch.empty(0, dtype=torch.float32, device=rank_device)
+            (y_pred, y_true) = make_auc_arrays(pos_pred, neg_pred)
+            result["AUC"] = evaluate_auc(y_pred, y_true)["AUC"]
+        return result
     neg_pred = score_edges(method, rowptr, col, deg, adj, neg_edge, **kwargs).view(-1).to(rank_device)
-    (y_pred, y_true) = make_auc_arrays(pos_pred, neg_pred)
-    auc_out = evaluate_auc(y_pred, y_true)
     npos = int(pos_pred.numel())
     neg_for_mrr = neg_pred
     if npos > 0 and neg_pred.numel() % npos == 0:
@@ -201,7 +204,11 @@ def run_split(method, rowptr, col, deg, adj, pos_edge, neg_edge, device, *, refe
         "Hits@50": mrr_out["mrr_hit50"],
         "Hits@100": mrr_out["mrr_hit100"],
     }
-    return {"AUC": auc_out["AUC"], "MRR": mrr_out["MRR"], **hits_out}
+    result = {"MRR": mrr_out["MRR"], **hits_out}
+    if compute_auc:
+        (y_pred, y_true) = make_auc_arrays(pos_pred, neg_pred)
+        result["AUC"] = evaluate_auc(y_pred, y_true)["AUC"]
+    return result
 
 
 def main():
@@ -220,6 +227,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device")
     ap.add_argument("--heuristic", type=str, default="all", choices=["all", "cn", "aa", "ra", "shortest_path", "katz"])
+    ap.add_argument("--compute-auc", choices=["yes", "no"], default="yes")
     ap.add_argument("--save-log", action="store_true", default=True)
     args = ap.parse_args()
     device = _resolve_device(args.device)
@@ -239,6 +247,8 @@ def main():
     print(f"heart_negatives_total_requested={args.heart_negatives}")
     print(f"runtime_limit_sec={RUNTIME_LIMIT_SEC}")
     print(f"runtime_limit_hours={RUNTIME_LIMIT_SEC / 3600:.2f}")
+    compute_auc = args.compute_auc == "yes"
+    print(f"compute_auc_effective={compute_auc}")
     t_load0 = time.perf_counter()
     data = _read_run_data(args, device)
     heart_candidate_metadata = persist_heart_candidate_metadata(args, data)
@@ -273,8 +283,30 @@ def main():
             break
         profiler = StageProfiler(device)
         profiler.start()
-        val = run_split(m, rowptr, col, deg, adj, data["valid_pos"], data["valid_neg"], device, reference_planetoid=reference_planetoid_heuristics)
-        test = run_split(m, rowptr, col, deg, adj, data["test_pos"], data["test_neg"], device, reference_planetoid=reference_planetoid_heuristics)
+        val = run_split(
+            m,
+            rowptr,
+            col,
+            deg,
+            adj,
+            data["valid_pos"],
+            data["valid_neg"],
+            device,
+            reference_planetoid=reference_planetoid_heuristics,
+            compute_auc=compute_auc,
+        )
+        test = run_split(
+            m,
+            rowptr,
+            col,
+            deg,
+            adj,
+            data["test_pos"],
+            data["test_neg"],
+            device,
+            reference_planetoid=reference_planetoid_heuristics,
+            compute_auc=compute_auc,
+        )
         eval_info = profiler.stop()
         elapsed = eval_info["sec"]
         results_by_method[m] = {
@@ -309,6 +341,7 @@ def main():
     log(f"runtime_limit_sec: {RUNTIME_LIMIT_SEC:.2f}")
     log(f"evaluation_mode: {args.mode}")
     log(f"evaluation_positive_cap: {args.eval_cap}")
+    log(f"compute_auc_effective: {compute_auc}")
     for key, value in heart_candidate_metadata.items():
         log(f"{key}: {(value if value is not None else 'not-applicable')}")
     log(f"ranking_device: {device}")

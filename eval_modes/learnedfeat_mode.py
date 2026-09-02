@@ -199,7 +199,6 @@ MODE_SPEC = {
     "force_node_embeddings": True,
     "default_seed": 0,
     "default_epochs": 500,
-    "require_output_width": True,
 }
 
 load_or_create_learnedfeat_test_negatives = partial(

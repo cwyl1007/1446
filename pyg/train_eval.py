@@ -99,10 +99,11 @@ def _group_scores(pos_pred, neg_pred, split=None):
     return neg_pred
 
 
-def _test_metrics(pos_pred, neg_pred, rank_scores=None, rank_stats=None):
+def _test_metrics(pos_pred, neg_pred, rank_scores=None, rank_stats=None, include_auc=True):
     stats = rank_stats if rank_stats is not None else evaluate_mrr(None, pos_pred, rank_scores if rank_scores is not None else neg_pred)
     results = _single_rank_result(stats)
-    results.update(_auc_pair(pos_pred, neg_pred))
+    if include_auc:
+        results.update(_auc_pair(pos_pred, neg_pred))
     return results
 
 
@@ -1012,25 +1013,37 @@ def _streamed_grouped_metrics_from_positive_scores(model, z, positive_scores, ne
     )
 
 
-def get_metric_score(_evaluator_hit, _evaluator_mrr, pos_train_pred, pos_val_pred, neg_val_pred, pos_test_pred, neg_test_pred):
+def get_metric_score(
+    _evaluator_hit,
+    _evaluator_mrr,
+    pos_train_pred,
+    pos_val_pred,
+    neg_val_pred,
+    pos_test_pred,
+    neg_test_pred,
+    *,
+    include_auc=True,
+):
     rank_stats = [evaluate_mrr(None, pos, neg) for pos, neg in ((pos_train_pred, neg_val_pred), (pos_val_pred, neg_val_pred), (pos_test_pred, neg_test_pred))]
     result = _pack_rank_results(*rank_stats)
-    result.update(_pack_auc_results(pos_train_pred, pos_val_pred, pos_test_pred, neg_val_pred.view(-1), neg_test_pred.view(-1)))
+    if include_auc:
+        result.update(_pack_auc_results(pos_train_pred, pos_val_pred, pos_test_pred, neg_val_pred.view(-1), neg_test_pred.view(-1)))
     return result
 
 
 @torch.no_grad()
-def evaluate_test_only_from_embedding(model, z, data, batch_size):
+def evaluate_test_only_from_embedding(model, z, data, batch_size, *, include_auc=True):
     device = z.device
     mode = data.get("mode", "heart")
     test_pos_source = data["test_pos"].to(dtype=torch.long).cpu()
     test_neg = data.get("test_neg")
     if _is_streamed_grouped_negative(test_neg):
         streamed = _streamed_grouped_split_metrics(
-            model, z, {"test": test_pos_source}, test_neg, batch_size, include_auc=True, include_hits=True
+            model, z, {"test": test_pos_source}, test_neg, batch_size, include_auc=include_auc, include_hits=True
         )
         results = _single_rank_result(streamed["test"]["rank"])
-        results.update(streamed["test"]["auc"])
+        if include_auc:
+            results.update(streamed["test"]["auc"])
         test_neg.last_evaluation_reuse = dict(streamed["reuse"])
         return results
     test_pos = test_pos_source.to(device=device, dtype=torch.long)
@@ -1039,13 +1052,23 @@ def evaluate_test_only_from_embedding(model, z, data, batch_size):
     reference_row_batch = int(getattr(model, "reference_evaluation_row_batch_size", 0) or 0)
     if reference_row_batch > 0 and test_neg is not None and not _is_ragged_negative(test_neg) and mode != "all":
         (pos_pred, neg_pred_flat) = _reference_grouped_edge_scores(model, z, test_pos, test_neg, batch_size)
-        return _test_metrics(pos_pred, neg_pred_flat, rank_scores=_group_scores(pos_pred, neg_pred_flat, "Test"))
+        return _test_metrics(
+            pos_pred,
+            neg_pred_flat,
+            rank_scores=_group_scores(pos_pred, neg_pred_flat, "Test"),
+            include_auc=include_auc,
+        )
     pos_pred = _test_edge_model(model, test_pos, z, batch_size).view(-1)
     if _is_ragged_negative(test_neg):
         (test_stats, neg_pred_flat) = _ragged_scores_and_stats(model, z, pos_pred, test_neg, batch_size)
-        return _test_metrics(pos_pred, neg_pred_flat, rank_stats=test_stats)
+        return _test_metrics(pos_pred, neg_pred_flat, rank_stats=test_stats, include_auc=include_auc)
     neg_pred_flat = _test_edge_model(model, test_neg, z, batch_size).view(-1)
-    return _test_metrics(pos_pred, neg_pred_flat, rank_scores=_group_scores(pos_pred, neg_pred_flat))
+    return _test_metrics(
+        pos_pred,
+        neg_pred_flat,
+        rank_scores=_group_scores(pos_pred, neg_pred_flat),
+        include_auc=include_auc,
+    )
 
 
 @torch.no_grad()
@@ -1099,17 +1122,17 @@ def validation_only(model, data, x, batch_size, profile=None, include_auc=True, 
 
 
 @torch.no_grad()
-def test_only(model, data, x, batch_size, profile=None):
+def test_only(model, data, x, batch_size, profile=None, *, include_auc=True):
     model.eval()
     z = _embed_for_evaluation(model, data, x, profile)
     started = time.time()
-    results = evaluate_test_only_from_embedding(model, z, data, batch_size)
+    results = evaluate_test_only_from_embedding(model, z, data, batch_size, include_auc=include_auc)
     _finish_profile(profile, x.device, "testing_sec", started)
     return results
 
 
 @torch.no_grad()
-def test(model, data, x, evaluator_hit, evaluator_mrr, batch_size, profile=None, return_scores=True):
+def test(model, data, x, evaluator_hit, evaluator_mrr, batch_size, profile=None, return_scores=True, *, include_auc=True):
     model.eval()
     mode = data.get("mode", "heart")
     device = x.device
@@ -1133,15 +1156,16 @@ def test(model, data, x, evaluator_hit, evaluator_mrr, batch_size, profile=None,
             {"train": train_val_source, "valid": valid_pos_source},
             valid_neg_source,
             batch_size,
-            include_auc=True,
+            include_auc=include_auc,
             include_hits=True,
         )
         test_stream = _streamed_grouped_split_metrics(
-            model, z, {"test": test_pos_source}, test_neg_source, batch_size, include_auc=True, include_hits=True
+            model, z, {"test": test_pos_source}, test_neg_source, batch_size, include_auc=include_auc, include_hits=True
         )
         results = _pack_rank_results(valid_stream["train"]["rank"], valid_stream["valid"]["rank"], test_stream["test"]["rank"])
-        results["AUC"] = (valid_stream["train"]["auc"]["AUC"], valid_stream["valid"]["auc"]["AUC"], test_stream["test"]["auc"]["AUC"])
-        results["AP"] = (valid_stream["train"]["auc"]["AP"], valid_stream["valid"]["auc"]["AP"], test_stream["test"]["auc"]["AP"])
+        if include_auc:
+            results["AUC"] = (valid_stream["train"]["auc"]["AUC"], valid_stream["valid"]["auc"]["AUC"], test_stream["test"]["auc"]["AUC"])
+            results["AP"] = (valid_stream["train"]["auc"]["AP"], valid_stream["valid"]["auc"]["AP"], test_stream["test"]["auc"]["AP"])
         valid_neg_source.last_evaluation_reuse = dict(valid_stream["reuse"])
         test_neg_source.last_evaluation_reuse = dict(test_stream["reuse"])
         _finish_profile(profile, device, "testing_sec", t_test)
@@ -1175,7 +1199,8 @@ def test(model, data, x, evaluator_hit, evaluator_mrr, batch_size, profile=None,
             )
             (test_stats, neg_test_flat) = _ragged_scores_and_stats(model, z, pos_test_pred, test_neg, batch_size)
             results = _pack_rank_results(train_stats, valid_stats, test_stats)
-            results.update(_pack_auc_results(pos_train_pred, pos_valid_pred, pos_test_pred, neg_valid_flat, neg_test_flat))
+            if include_auc:
+                results.update(_pack_auc_results(pos_train_pred, pos_valid_pred, pos_test_pred, neg_valid_flat, neg_test_flat))
             scores = [pos_valid_pred.cpu(), neg_valid_flat.cpu(), pos_test_pred.cpu(), neg_test_flat.cpu(), z.cpu()] if return_scores else []
             return (results, scores)
         neg_valid_pred_flat = _test_edge_model(model, valid_neg, z, batch_size).view(-1)
@@ -1184,7 +1209,16 @@ def test(model, data, x, evaluator_hit, evaluator_mrr, batch_size, profile=None,
         neg_test_pred = _group_scores(pos_test_pred, neg_test_pred_flat)
     _finish_profile(profile, device, "inference_sec", t_infer)
     t_test = time.time()
-    results = get_metric_score(evaluator_hit, evaluator_mrr, pos_train_pred, pos_valid_pred, neg_valid_pred, pos_test_pred, neg_test_pred)
+    results = get_metric_score(
+        evaluator_hit,
+        evaluator_mrr,
+        pos_train_pred,
+        pos_valid_pred,
+        neg_valid_pred,
+        pos_test_pred,
+        neg_test_pred,
+        include_auc=include_auc,
+    )
     _finish_profile(profile, device, "testing_sec", t_test)
     scores = [pos_valid_pred.cpu(), neg_valid_pred_flat.cpu(), pos_test_pred.cpu(), neg_test_pred_flat.cpu(), z.cpu()] if return_scores else []
     return (results, scores)

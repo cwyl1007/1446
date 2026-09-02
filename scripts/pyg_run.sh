@@ -3,8 +3,8 @@ PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 1
 
 MODES="heart"
-DATASETS="facebook"
-MODELS="mf mlp ppr concat gcn gat sage gae seal buddy neo-gnn ncn ncnc nbfnet peg lpformer n2v heuristics"
+DATASETS="wiki-squirrel"
+MODELS="gat"
 GPUS="0 1 2"
 
 POOL="all"
@@ -13,6 +13,7 @@ HEART_BACKEND="gpu"
 HEART_BATCH_SIZE="2048"
 NUM_RUNS="5"
 BASE_SEED="0"
+COMPUTE_AUC="no"
 NUMBA_THREADS_PER_WORKER="24"
 
 SEEN_GPUS=""
@@ -104,20 +105,23 @@ run_job() {
         --dataset "$job_dataset" --model "$job_model" --num-runs "$NUM_RUNS" \
         --base-seed "$BASE_SEED" --pool "$POOL" --heart-negatives "$HEART_NEGATIVES" \
         --heart-backend "$HEART_BACKEND" \
-        --heart-batch-size "$HEART_BATCH_SIZE"
+        --heart-batch-size "$HEART_BATCH_SIZE" \
+        --compute-auc "$COMPUTE_AUC"
       ;;
     n2v)
       run_child python -m pyg.n2v_main --device cuda --mode "$job_mode" \
         --dataset "$job_dataset" --num-runs "$NUM_RUNS" --base-seed "$BASE_SEED" \
         --pool "$POOL" --heart-negatives "$HEART_NEGATIVES" \
         --heart-backend "$HEART_BACKEND" \
-        --heart-batch-size "$HEART_BATCH_SIZE"
+        --heart-batch-size "$HEART_BATCH_SIZE" \
+        --compute-auc "$COMPUTE_AUC"
       ;;
     heuristics)
       run_child python -m pyg.heuristics_main --device cuda --mode "$job_mode" \
         --dataset "$job_dataset" --seed "$BASE_SEED" --pool "$POOL" \
         --heart-negatives "$HEART_NEGATIVES" \
-        --heart-backend "$HEART_BACKEND" --heart-batch-size "$HEART_BATCH_SIZE"
+        --heart-backend "$HEART_BACKEND" --heart-batch-size "$HEART_BATCH_SIZE" \
+        --compute-auc "$COMPUTE_AUC"
       ;;
     *) echo "Unknown PyG job kind: $job_kind" >&2; return 1 ;;
   esac

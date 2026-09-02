@@ -40,8 +40,8 @@ HEART_MODES = {"heart"}
 HEART_BENCHMARK_PYG_DATASETS = {"cora", "citeseer", "pubmed"}
 HEART_BENCHMARK_OGB_DATASETS = {"ogbl-collab", "ogbl-ddi", "ogbl-ppa", "ogbl-citation2"}
 _SHARED_N2V_EMBEDDING_CACHE = {}
-SPECIAL_GROUPED_MATERIALIZE_MAX_EDGES = 3000000
-SPECIAL_GROUPED_MATERIALIZE_MAX_BYTES = 64 * 1024 * 1024
+SPECIAL_GROUPED_MATERIALIZE_MAX_EDGES = 16000000
+SPECIAL_GROUPED_MATERIALIZE_MAX_BYTES = 256 * 1024 * 1024
 
 
 def project_path(value):
@@ -1042,8 +1042,7 @@ def _grouped_split_result(positives, grouped, ranks, auc, candidate_label):
     count = int(positives.size(0))
     candidates_per_positive = int(grouped.size(1))
     metrics = rank_metrics(ranks)
-    metrics["AUC"] = float(auc)
-    return {
+    result = {
         "num_positive_edges": count,
         "metrics": metrics,
         "hit_counts": rank_hit_counts(ranks),
@@ -1051,9 +1050,14 @@ def _grouped_split_result(positives, grouped, ranks, auc, candidate_label):
         "candidate_counts": grouped_candidate_summary(positives, grouped),
         "negative_group_shape": [count, candidates_per_positive, 2],
         "rank_definition": "0.5 * (#grouped negative >= positive + #grouped negative > positive) + 1",
-        "auc_definition": f"binary AUC over all split positives and the flattened grouped {candidate_label} negatives; ties receive 0.5",
-        "num_auc_negative_predictions": count * candidates_per_positive,
     }
+    if auc is not None:
+        metrics["AUC"] = float(auc)
+        result["auc_definition"] = (
+            f"binary AUC over all split positives and the flattened grouped {candidate_label} negatives; ties receive 0.5"
+        )
+        result["num_auc_negative_predictions"] = count * candidates_per_positive
+    return result
 
 
 def _auc_wins(sorted_positive, scores):
@@ -1074,6 +1078,7 @@ def _evaluate_endpoint_grouped_split(
     description,
     candidate_label,
     endpoint_score_reuse_safe,
+    compute_auc,
 ):
     if endpoint_score_reuse_safe is not True:
         raise RuntimeError(
@@ -1090,11 +1095,11 @@ def _evaluate_endpoint_grouped_split(
     count = int(positives.size(0))
     candidates_per_positive = int(grouped.size(1))
     work_device = positive_scores.device
-    sorted_positive = torch.sort(positive_scores).values
+    sorted_positive = torch.sort(positive_scores).values if compute_auc else None
     ge_total = torch.zeros(count, dtype=torch.int32, device=work_device)
     gt_total = torch.zeros_like(ge_total)
     candidate_counts = torch.zeros_like(ge_total)
-    auc_numerator = torch.zeros((), dtype=torch.float64, device=work_device)
+    auc_numerator = torch.zeros((), dtype=torch.float64, device=work_device) if compute_auc else None
     batch_size = max(1, int(edge_batch_size))
     query_oriented = bool(getattr(scoring_grouped, "endpoint_query_oriented", False))
     decoded_union_edges = 0
@@ -1138,8 +1143,9 @@ def _evaluate_endpoint_grouped_split(
         candidate_counts.index_add_(
             0, row_ids, torch.full((int(row_ids.numel()),), int(grouped.negatives_per_side), dtype=torch.int32, device=work_device)
         )
-        multiplicity = chunk.union_occurrence_multiplicity.to(device=work_device, dtype=torch.float64)
-        auc_numerator += (_auc_wins(sorted_positive, union_scores) * multiplicity).sum()
+        if compute_auc:
+            multiplicity = chunk.union_occurrence_multiplicity.to(device=work_device, dtype=torch.float64)
+            auc_numerator += (_auc_wins(sorted_positive, union_scores) * multiplicity).sum()
     if not bool(candidate_counts.eq(candidates_per_positive).all().item()):
         raise ValueError(
             "Endpoint-grouped checkpoint evaluation did not consume exactly one complete left and right side for every positive row."
@@ -1149,7 +1155,7 @@ def _evaluate_endpoint_grouped_split(
         raise ValueError("Endpoint-grouped logical occurrence count does not match its shape.")
     ranks = 0.5 * (ge_total.float() + gt_total.float()) + 1.0
     auc_denominator = count * total_negatives
-    auc = float((auc_numerator / auc_denominator).item()) if auc_denominator else 0.0
+    auc = float((auc_numerator / auc_denominator).item()) if compute_auc and auc_denominator else (0.0 if compute_auc else None)
     result = _grouped_split_result(positives, grouped, ranks, auc, candidate_label)
     result["endpoint_grouped_reuse"] = {
         "decoded_union_edges": decoded_union_edges,
@@ -1171,6 +1177,7 @@ def evaluate_grouped_split(
     candidate_label="HeaRT",
     negative_edges_for_scoring=None,
     endpoint_score_reuse_safe=False,
+    compute_auc=True,
 ):
     positives = pos_edges.long().cpu()
     grouped = grouped_negative_edges(negative_edges, positives)
@@ -1182,7 +1189,7 @@ def evaluate_grouped_split(
     if int(positive_scores.numel()) != count:
         raise RuntimeError(f"Expected {count} positive scores, got {positive_scores.numel()}.")
     if count == 0:
-        return _grouped_split_result(positives, grouped, torch.empty(0), 0.0, candidate_label)
+        return _grouped_split_result(positives, grouped, torch.empty(0), 0.0 if compute_auc else None, candidate_label)
     if negative_edges_for_scoring is None:
         scoring_grouped = grouped
     else:
@@ -1201,12 +1208,13 @@ def evaluate_grouped_split(
             description,
             candidate_label,
             endpoint_score_reuse_safe,
+            compute_auc,
         )
     work_device = positive_scores.device
-    sorted_positive = torch.sort(positive_scores).values
+    sorted_positive = torch.sort(positive_scores).values if compute_auc else None
     ge_total = torch.zeros(count, dtype=torch.int64, device=work_device)
     gt_total = torch.zeros_like(ge_total)
-    auc_numerator = torch.zeros((), dtype=torch.float64, device=work_device)
+    auc_numerator = torch.zeros((), dtype=torch.float64, device=work_device) if compute_auc else None
     streaming_scoring = bool(getattr(scoring_grouped, "is_streaming_negative", False))
     total_negatives = count * candidates_per_positive
     batch_size = max(1, int(edge_batch_size))
@@ -1247,10 +1255,11 @@ def evaluate_grouped_split(
         thresholds = positive_scores[rows]
         ge_total.index_add_(0, rows, (scores >= thresholds).to(dtype=torch.int64))
         gt_total.index_add_(0, rows, (scores > thresholds).to(dtype=torch.int64))
-        auc_numerator += _auc_wins(sorted_positive, scores).sum()
+        if compute_auc:
+            auc_numerator += _auc_wins(sorted_positive, scores).sum()
     ranks = 0.5 * (ge_total.float() + gt_total.float()) + 1.0
     auc_denominator = count * total_negatives
-    auc = float((auc_numerator / auc_denominator).item()) if auc_denominator else 0.0
+    auc = float((auc_numerator / auc_denominator).item()) if compute_auc and auc_denominator else (0.0 if compute_auc else None)
     return _grouped_split_result(positives, grouped, ranks, auc, candidate_label)
 
 
@@ -1267,6 +1276,7 @@ def evaluate_split(
     quiet,
     description,
     positive_scores=None,
+    compute_auc=True,
 ):
     pos_edges = pos_edges.long().cpu().contiguous()
     if isinstance(rowptr, dict) != isinstance(col, dict):
@@ -1294,7 +1304,7 @@ def evaluate_split(
     if count == 0:
         empty = torch.empty(0, dtype=torch.long)
         metrics = rank_metrics(empty)
-        if positive_scores is not None or bool(getattr(score_all_nodes, "is_retrieval_rerank", False)):
+        if compute_auc and (positive_scores is not None or bool(getattr(score_all_nodes, "is_retrieval_rerank", False))):
             metrics["AUC"] = 0.0
         return {
             "num_positive_edges": 0,
@@ -1317,8 +1327,9 @@ def evaluate_split(
             positive_scores = positive_scores.float()
         if int(positive_scores.numel()) != count:
             raise RuntimeError(f"Expected {count} positive scores, got {positive_scores.numel()}.")
-        sorted_positive = torch.sort(positive_scores).values
-        auc_numerator = torch.zeros((), dtype=torch.float64, device=sorted_positive.device)
+        if compute_auc:
+            sorted_positive = torch.sort(positive_scores).values
+            auc_numerator = torch.zeros((), dtype=torch.float64, device=sorted_positive.device)
     accumulator_device = torch.device("cpu") if retrieval_rerank else positive_scores.device
     ge_total = torch.zeros(count, dtype=torch.int64, device=accumulator_device)
     gt_total = torch.zeros_like(ge_total)
@@ -1413,15 +1424,16 @@ def evaluate_split(
                     raise RuntimeError("Query-aware cascade did not report one retrieval indicator per positive.")
                 retrieval_hits += int(query_hits.sum().item())
                 retrieval_queries += end - start
-                negative_device = negative_counts[start:end].to(device=score_device, dtype=torch.float64)
-                valid_auc = negative_device > 0
-                if bool(valid_auc.any()):
-                    ge_float = ge_block.to(torch.float64)
-                    gt_float = gt_block.to(torch.float64)
-                    tied_negative = (ge_float - gt_float).clamp_min(0.0)
-                    wins = negative_device - gt_float - 0.5 * tied_negative
-                    query_auc_sum += float((wins[valid_auc] / negative_device[valid_auc]).sum().item())
-                    query_auc_count += int(valid_auc.sum().item())
+                if compute_auc:
+                    negative_device = negative_counts[start:end].to(device=score_device, dtype=torch.float64)
+                    valid_auc = negative_device > 0
+                    if bool(valid_auc.any()):
+                        ge_float = ge_block.to(torch.float64)
+                        gt_float = gt_block.to(torch.float64)
+                        tied_negative = (ge_float - gt_float).clamp_min(0.0)
+                        wins = negative_device - gt_float - 0.5 * tied_negative
+                        query_auc_sum += float((wins[valid_auc] / negative_device[valid_auc]).sum().item())
+                        query_auc_count += int(valid_auc.sum().item())
             ge_total.index_add_(0, rows, ge)
             gt_total.index_add_(0, rows, gt)
             continue
@@ -1470,7 +1482,7 @@ def evaluate_split(
         ge -= positive_in_candidates.to(torch.int64)
         ge_total.index_add_(0, rows, ge.clamp_min(0).to(accumulator_device))
         gt_total.index_add_(0, rows, gt.to(accumulator_device))
-        if retrieval_rerank:
+        if retrieval_rerank and compute_auc:
             negative_device = negative_counts.to(device=score_device, dtype=torch.float64)
             valid_auc = negative_device > 0
             if bool(valid_auc.any()):
@@ -1483,7 +1495,7 @@ def evaluate_split(
     ranks = 0.5 * (ge_total.float() + gt_total.float()) + 1.0
     definition = "0.5 * (#negative >= positive + #negative > positive) + 1"
     metrics = rank_metrics(ranks)
-    if retrieval_rerank:
+    if retrieval_rerank and compute_auc:
         metrics["AUC"] = query_auc_sum / query_auc_count if query_auc_count else 0.0
     elif sorted_positive is not None:
         negative_count = int(auc_negative_count.item())
@@ -1498,7 +1510,8 @@ def evaluate_split(
         "rank_definition": definition,
     }
     if retrieval_rerank:
-        result["auc_definition"] = "mean query-conditioned AUC over every legal full-graph negative; ties receive 0.5"
+        if compute_auc:
+            result["auc_definition"] = "mean query-conditioned AUC over every legal full-graph negative; ties receive 0.5"
         result["retrieval"] = {
             "protocol": "factorized_retrieval_then_llama_rerank",
             "filtered_query_positive_handling": "restore_only_the_current_query_before_topk_reranking",
@@ -1756,6 +1769,7 @@ def parse_args(evaluator):
     add("--edge-batch-size", type=int, default=0)
     add("--node-chunk-size", type=int, default=0)
     add("--comparison-batch-size", type=int, default=256)
+    add("--compute-auc", choices=["yes", "no"], default="yes")
     add("--output")
     add("--no-save", action="store_true")
     add("--quiet", action="store_true")
@@ -2123,6 +2137,15 @@ def _uses_collab_heart_heuristic_protocol(framework, dataset):
     return str(framework).strip().lower() == "ogb" and str(dataset).strip().lower() == "ogbl-collab"
 
 
+_LEARNEDFEAT_PATH_MAX_DENSE_ELEMS = {
+    # Match the specialized FullGraph workspace budgets while retaining the
+    # generic targeted scorer used by LearnedFeat.
+    "shortest_path": 16_000_000,
+    "sp": 16_000_000,
+    "katz": 64_000_000,
+}
+
+
 def heuristic_score_kwargs(method, framework, dataset, device, args):
     normalized_method = str(method).strip().lower()
     source_batch_size = getattr(args, "source_batch_size", None)
@@ -2144,17 +2167,27 @@ def heuristic_score_kwargs(method, framework, dataset, device, args):
                 raise ValueError(
                     "ogbl-collab uses released OGB reference Katz max_length=2; an incompatible --katz-max-length override was supplied."
                 )
-        return _method_kwargs(normalized_method, device, edge_batch_size=edge_batch_size, source_batch_size=source_batch_size)
-    kwargs = {"device": device, "edge_batch_size": edge_batch_size}
-    if source_batch_size is not None:
-        kwargs["source_batch_size"] = int(source_batch_size)
-    if normalized_method in {"shortest_path", "sp"}:
-        cutoff = getattr(args, "shortest_path_cutoff", None)
-        kwargs.update({"cutoff": 10 if cutoff is None else int(cutoff), "transform": "inv"})
-    elif normalized_method == "katz":
-        beta = getattr(args, "katz_beta", None)
-        max_length = getattr(args, "katz_max_length", None)
-        kwargs.update({"beta": 0.01 if beta is None else float(beta), "max_length": 5 if max_length is None else int(max_length)})
+        kwargs = _method_kwargs(
+            normalized_method,
+            device,
+            edge_batch_size=edge_batch_size,
+            source_batch_size=source_batch_size,
+        )
+    else:
+        kwargs = {"device": device, "edge_batch_size": edge_batch_size}
+        if source_batch_size is not None:
+            kwargs["source_batch_size"] = int(source_batch_size)
+        if normalized_method in {"shortest_path", "sp"}:
+            cutoff = getattr(args, "shortest_path_cutoff", None)
+            kwargs.update({"cutoff": 10 if cutoff is None else int(cutoff), "transform": "inv"})
+        elif normalized_method == "katz":
+            beta = getattr(args, "katz_beta", None)
+            max_length = getattr(args, "katz_max_length", None)
+            kwargs.update({"beta": 0.01 if beta is None else float(beta), "max_length": 5 if max_length is None else int(max_length)})
+    if str(getattr(args, "candidate_policy", "")).strip().lower() == "learnedfeat":
+        max_dense_elems = _LEARNEDFEAT_PATH_MAX_DENSE_ELEMS.get(normalized_method)
+        if max_dense_elems is not None:
+            kwargs["max_dense_elems"] = max_dense_elems
     return kwargs
 
 
@@ -2340,6 +2373,7 @@ def evaluate_heuristic_split(method, graph, pos_edges, filter_rowptr, filter_col
         args.quiet,
         description,
         positive_scores=positive_scores,
+        compute_auc=args.compute_auc == "yes",
     )
     result["score_backend"] = "batched_device_one_vs_all"
     result["ranking_device"] = str(score_device)
@@ -2383,6 +2417,7 @@ def evaluate_grouped_heuristic_split(
         candidate_label=candidate_label,
         negative_edges_for_scoring=scoring_negatives,
         endpoint_score_reuse_safe=True,
+        compute_auc=args.compute_auc == "yes",
     )
     result["score_backend"] = "device_grouped_heuristic"
     result["ranking_device"] = str(positive_scores.device)
@@ -2457,10 +2492,12 @@ def save_payload(payload, args, framework, mode, dataset, name, evaluator):
 
 
 def render_metrics(metrics):
-    missing = [metric for metric in FINAL_METRICS if metric not in metrics]
+    required = FINAL_METRICS[:-1]
+    missing = [metric for metric in required if metric not in metrics]
     if missing:
         raise ValueError(f"Missing final metrics: {', '.join(missing)}")
-    return " ".join((f"{metric}={format_metric_value(metrics[metric], scale=100.0)}" for metric in FINAL_METRICS))
+    selected = (*required, *(("AUC",) if "AUC" in metrics else ()))
+    return " ".join((f"{metric}={format_metric_value(metrics[metric], scale=100.0)}" for metric in selected))
 
 
 def grouped_results_use_both_sides(results):
@@ -2532,6 +2569,7 @@ def evaluate_checkpoint(
                 bundle["test_pos"], bundle["test_neg"], positive_scores, negative_scorer, batch_size, args.quiet,
                 f"run {checkpoint.get('run', '?')} test {candidate_policy}", candidate_label=evaluator.CANDIDATE_LABEL,
                 endpoint_score_reuse_safe=getattr(model, "decode_is_dedup_safe", None) is True,
+                compute_auc=args.compute_auc == "yes",
             )
             split_result["score_backend"] = str(getattr(negative_scorer, "score_backend", "checkpoint_model_decode"))
         else:
@@ -2544,6 +2582,7 @@ def evaluate_checkpoint(
                 bundle["test_pos"], filter_rowptr, filter_col, framework, scorer, num_nodes(bundle, framework), True,
                 max(1, int(args.comparison_batch_size)), args.quiet, f"run {checkpoint.get('run', '?')} test",
                 positive_scores=positive_scores,
+                compute_auc=args.compute_auc == "yes",
             )
             split_result["known_positive_filter"] = dict(bundle["full_graph_known_positive_filter"])
             split_result["score_backend"] = str(getattr(scorer, "score_backend", "checkpoint_model_decode"))
@@ -2695,6 +2734,7 @@ def run_heuristics_for_mode(args, evaluator):
         "seed": data_seed,
         "split": args.split,
         "candidate_policy": evaluator.POLICY,
+        "compute_auc": args.compute_auc == "yes",
         "heuristic_protocol": dict(score_protocol),
         **complete_test_positive_result_metadata(
             bundle, auxiliary_loader_eval_cap=cap if not evaluator.GROUPED else None
@@ -2837,6 +2877,7 @@ def run_checkpoints_for_mode(args, evaluator):
         "checkpoint_types": sorted({result["checkpoint_type"] for result in results}),
         "split": args.split,
         "candidate_policy": evaluator.POLICY,
+        "compute_auc": args.compute_auc == "yes",
         "positive_query_scope": results[0]["positive_query_scope"],
         "positive_eval_cap": results[0]["positive_eval_cap"],
         "test_positive_scope": dict(results[0]["test_positive_scope"]),

@@ -391,10 +391,10 @@ def _planetoid_reference_validation_only(model, data_dict, device, batch_size, p
 
 
 @torch.no_grad()
-def _planetoid_reference_test_only(model, data_dict, device, batch_size, profile=None):
+def _planetoid_reference_test_only(model, data_dict, device, batch_size, profile=None, *, include_auc=True):
     edge_model, z = _reference_evaluation_context(model, device, batch_size, profile)
     started = time.time()
-    results = evaluate_test_only_from_embedding(edge_model, z, data_dict, batch_size)
+    results = evaluate_test_only_from_embedding(edge_model, z, data_dict, batch_size, include_auc=include_auc)
     _finish_profile(profile, device, "testing_sec", started)
     return results
 
@@ -406,6 +406,7 @@ def parse_args():
     parser.add_argument("--n2v-protocol", choices=["auto", "reference", "legacy-direct"], default="auto")
     parser.add_argument("--n2v-cache-dir")
     parser.add_argument("--metric", type=str, default="mrr")
+    parser.add_argument("--compute-auc", choices=["yes", "no"], default="yes")
     parser.add_argument("--mode", choices=["heart", "all"], default="heart")
     parser.add_argument("--eval-cap", "--eval_cap", dest="eval_cap", type=int, default=None)
     parser.add_argument("--pool", type=parse_pool_argument, default=10000)
@@ -453,6 +454,10 @@ def main():
     reference_matmul_precision = _configure_planetoid_n2v_reference_math(device) if reference_protocol else "legacy-default"
     args.eval_cap = _resolve_eval_cap(args.eval_cap, args.mode, args.dataset)
     metric_key = args.metric.strip()
+    compute_auc = args.compute_auc == "yes"
+    selection_requires_auc = metric_key.lower() in {"auc", "ap"}
+    if selection_requires_auc and not compute_auc:
+        raise ValueError("--metric AUC/AP requires --compute-auc yes.")
     timed_out = False
     log_path = None
     if args.save_log:
@@ -462,6 +467,7 @@ def main():
     for line in (
         f"Using device: {device}", f"matmul_precision={reference_matmul_precision}", f"n2v_protocol_requested={args.n2v_protocol}",
         f"n2v_protocol_effective={protocol}", f"Selection/reporting metric: {args.metric}", f"Evaluation mode: {args.mode}",
+        f"compute_auc_effective={compute_auc}",
         f"eval_cap={args.eval_cap}", f"pool={args.pool}", "heart_negatives=generated-online",
         f"heart_negatives_total_requested={args.heart_negatives}", f"runtime_limit_sec={RUNTIME_LIMIT_SEC}",
         f"runtime_limit_hours={RUNTIME_LIMIT_SEC / 3600:.2f}",
@@ -472,7 +478,6 @@ def main():
     heart_candidate_metadata = persist_heart_candidate_metadata(args, data)
     heart_validation_only = args.mode == "heart"
     selection_validation_only = reference_protocol or heart_validation_only
-    selection_requires_auc = metric_key.lower() in {"auc", "ap"}
     selection_requires_hits = metric_key.lower() != "mrr"
     for key, value in heart_candidate_metadata.items():
         print(f"{key}={(value if value is not None else 'not-applicable')}", flush=True)
@@ -667,7 +672,16 @@ def main():
                     include_auc=selection_requires_auc, include_hits=selection_requires_hits
                 )
             else:
-                (results_rank, _) = test(model, data, x, evaluator_hit, evaluator_mrr, args.eval_batch_size, profile=eval_profile)
+                (results_rank, _) = test(
+                    model,
+                    data,
+                    x,
+                    evaluator_hit,
+                    evaluator_mrr,
+                    args.eval_batch_size,
+                    profile=eval_profile,
+                    include_auc=compute_auc,
+                )
             eval_info = eval_profiler.stop()
             epoch_eval_sec = eval_info["sec"]
             epoch_inference_sec = float(eval_profile.get("inference_sec", epoch_eval_sec))
@@ -732,10 +746,22 @@ def main():
                 try:
                     if reference_protocol:
                         final_validation_metrics = _planetoid_reference_validation_only(
-                            model, data, device, reference_eval_batch_size, profile=deferred_profile, include_auc=True
+                            model,
+                            data,
+                            device,
+                            reference_eval_batch_size,
+                            profile=deferred_profile,
+                            include_auc=compute_auc,
                         )
                     else:
-                        final_validation_metrics = validation_only(model, data, x, args.eval_batch_size, profile=deferred_profile, include_auc=True)
+                        final_validation_metrics = validation_only(
+                            model,
+                            data,
+                            x,
+                            args.eval_batch_size,
+                            profile=deferred_profile,
+                            include_auc=compute_auc,
+                        )
                 finally:
                     deferred_info = deferred_profiler.stop()
                 deferred_selected_key = _find_result_key(final_validation_metrics, metric_key)
@@ -767,9 +793,23 @@ def main():
             final_profiler.start()
             try:
                 if reference_protocol:
-                    final_test_metrics = _planetoid_reference_test_only(model, data, device, reference_eval_batch_size, profile=final_profile)
+                    final_test_metrics = _planetoid_reference_test_only(
+                        model,
+                        data,
+                        device,
+                        reference_eval_batch_size,
+                        profile=final_profile,
+                        include_auc=compute_auc,
+                    )
                 else:
-                    final_test_metrics = test_only(model, data, x, args.eval_batch_size, profile=final_profile)
+                    final_test_metrics = test_only(
+                        model,
+                        data,
+                        x,
+                        args.eval_batch_size,
+                        profile=final_profile,
+                        include_auc=compute_auc,
+                    )
             finally:
                 final_info = final_profiler.stop()
             run_test_sec = float(final_info["sec"])
@@ -891,6 +931,7 @@ def main():
     header_lines = [
         "\n" + "=" * 80, "Timing summary", f"dataset: {args.dataset}", f"mode: {args.mode}", "model: n2v",
         f"n2v_protocol_requested: {args.n2v_protocol}", f"n2v_protocol_effective: {protocol}", f"device: {device}",
+        f"compute_auc: {args.compute_auc}",
         f"evaluation_positive_cap: {args.eval_cap}",
         "evaluation_scope: " + ("configured_heart_validation_and_test_rows" if heart_validation_only else "configured_validation_and_test_rows"),
         "model_selection_evaluation: " + ("validation_final_test_only" if selection_validation_only else "validation_and_test"),
